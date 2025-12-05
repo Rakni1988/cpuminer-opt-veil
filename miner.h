@@ -443,20 +443,31 @@ float cpu_temp( int core );
 struct work
 {
    uint32_t target[8] __attribute__ ((aligned (64)));
-	uint32_t data[48] __attribute__ ((aligned (64)));
-	double targetdiff;
-	double sharediff;
+   uint32_t data[48] __attribute__ ((aligned (64)));
+   double targetdiff;
+   double sharediff;
    double stratum_diff;
-	int height;
-	char *txs;
+   int height;
+   char *txs;
    int tx_count;
    char *workid;
-	char *job_id;
-	size_t xnonce2_len;
-	unsigned char *xnonce2;
+   char *job_id;
+   size_t xnonce2_len;
+   unsigned char *xnonce2;
    bool sapling;
    bool stale;
+
+   // ===== VEIL SHA256Dv =====
+   bool veil_sha256dv;
+   unsigned char veil_midstate_be[32];
+   unsigned char veil_merkle_be[32];
+   uint32_t veil_ntime;
+   uint32_t veil_nonce_hi;
+   uint32_t veil_nonce_lo;
+   // ==========================
+
 } __attribute__ ((aligned (WORK_ALIGNMENT)));
+
 
 struct stratum_job
 {
@@ -475,6 +486,16 @@ struct stratum_job
 	double diff;
    bool clean;
    // for x16rt-veil
+
+   // ===== VEIL SHA256Dv =====
+   bool veil_sha256dv;
+
+   unsigned char veil_midstate_be[32];
+   unsigned char veil_merkle_be[32];
+   uint32_t veil_ntime;
+   uint32_t veil_nonce_hi;
+   // ==========================
+
    unsigned char extra[64];
    unsigned char denom10[32];
    unsigned char denom100[32];
@@ -626,6 +647,7 @@ enum algos {
         ALGO_SCRYPT,
         ALGO_SHA256D,
         ALGO_SHA256DT,
+        ALGO_SHA256DV,
         ALGO_SHA256Q,
         ALGO_SHA256T,
         ALGO_SHA3D,
@@ -723,6 +745,7 @@ static const char* const algo_names[] = {
         "scrypt",
         "sha256d",
         "sha256dt",
+        "sha256dv",
         "sha256q",
         "sha256t",
         "sha3d",
@@ -887,6 +910,7 @@ Options:\n\
                           scryptn2      scrypt(1048576, 1,1)\n\
                           sha256d       Double SHA-256\n\
                           sha256dt      Modified sha256d (Novo)\n\
+                          sha256dv      Modified sha256d (Veil)\n\
                           sha256q       Quad SHA-256, Pyrite (PYE)\n\
                           sha256t       Triple SHA-256, Onecoin (OC)\n\
                           sha3d         Double Keccak256 (BSHA3)\n\

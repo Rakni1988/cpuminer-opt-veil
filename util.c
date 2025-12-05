@@ -1962,6 +1962,120 @@ static uint32_t getblocheight(struct stratum_ctx *sctx)
 
 static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 {
+    if (opt_algo == ALGO_SHA256DV) {
+        json_t *params_arr = params;
+        if (!json_is_array(params_arr)) {
+            applog(LOG_ERR, "SHA256Dv notify: params is not array");
+            return false;
+        }
+
+        int jsize = json_array_size(params_arr);
+        if (jsize < 11) {
+            applog(LOG_ERR, "SHA256Dv notify: expected 11 params, got %d", jsize);
+            return false;
+        }
+
+        struct stratum_job *job = &sctx->job;
+
+        json_t *j_job_id = json_array_get(params_arr, 0);
+        if (!json_is_string(j_job_id)) {
+            applog(LOG_ERR, "SHA256Dv notify: job_id is not string");
+            return false;
+        }
+        const char *job_id = json_string_value(j_job_id);
+
+        json_t *j_ver = json_array_get(params_arr, 1);
+        if (!json_is_integer(j_ver)) {
+            applog(LOG_ERR, "SHA256Dv notify: version is not integer");
+            return false;
+        }
+        uint32_t version = (uint32_t)json_integer_value(j_ver);
+
+        json_t *j_mid = json_array_get(params_arr, 2);
+        json_t *j_mrk = json_array_get(params_arr, 3);
+        if (!json_is_string(j_mid) || !json_is_string(j_mrk)) {
+            applog(LOG_ERR, "SHA256Dv notify: midstate/merkle not string");
+            return false;
+        }
+        const char *midstate_hex = json_string_value(j_mid);
+        const char *merkle_hex   = json_string_value(j_mrk);
+
+        json_t *j_ntime = json_array_get(params_arr, 5);
+        if (!json_is_integer(j_ntime)) {
+            applog(LOG_ERR, "SHA256Dv notify: ntime is not integer");
+            return false;
+        }
+
+        json_t *j_nbits = json_array_get(params_arr, 6);
+        if (!json_is_string(j_nbits)) {
+            applog(LOG_ERR, "SHA256Dv notify: nbits is not string");
+            return false;
+        }
+        const char *nbits_hex = json_string_value(j_nbits);
+
+        json_t *j_nonce_hi = json_array_get(params_arr, 7);
+        if (!json_is_integer(j_nonce_hi)) {
+            applog(LOG_ERR, "SHA256Dv notify: nonce_hi is not integer");
+            return false;
+        }
+
+        json_t *j_clean = json_array_get(params_arr, 8);
+        if (!json_is_boolean(j_clean)) {
+            applog(LOG_ERR, "SHA256Dv notify: clean is not boolean");
+            return false;
+        }
+
+        json_t *j_height = json_array_get(params_arr, 9);
+        if (!json_is_integer(j_height)) {
+            applog(LOG_ERR, "SHA256Dv notify: height is not integer");
+            return false;
+        }
+
+        json_t *j_txcount = json_array_get(params_arr, 10);
+        if (!json_is_integer(j_txcount)) {
+            applog(LOG_ERR, "SHA256Dv notify: tx_count is not integer");
+            return false;
+        }
+
+        uint32_t ntime     = (uint32_t)json_integer_value(j_ntime);
+        uint32_t nonce_hi  = (uint32_t)json_integer_value(j_nonce_hi);
+        int      height    = (int)json_integer_value(j_height);
+        int      tx_count  = (int)json_integer_value(j_txcount);
+        bool     clean     = json_is_true(j_clean);
+
+        pthread_mutex_lock(&sctx->work_lock);
+
+        free(job->job_id);
+        job->job_id = strdup(job_id);
+
+        job->version[0] =  version        & 0xff;
+        job->version[1] = (version >> 8)  & 0xff;
+        job->version[2] = (version >> 16) & 0xff;
+        job->version[3] = (version >> 24) & 0xff;
+
+        hex2bin(job->veil_midstate_be, midstate_hex, 32);
+        hex2bin(job->veil_merkle_be,   merkle_hex,   32);
+
+        job->veil_ntime    = ntime;
+        job->veil_nonce_hi = nonce_hi;
+
+        hex2bin(job->nbits, nbits_hex, 4);
+
+        job->veil_sha256dv = true;
+        job->clean         = clean;
+        job->diff          = sctx->next_diff;
+
+        sctx->block_height     = height;
+        sctx->work.height      = height;
+        sctx->work.tx_count    = tx_count;
+
+        sctx->new_job = true;
+
+        pthread_mutex_unlock(&sctx->work_lock);
+
+        return true;
+    }
+
 	const char *job_id, *prevhash, *coinb1, *coinb2, *version, *nbits, *stime;
    const char *finalsaplinghash = NULL;
    const char *denom10 = NULL, *denom100 = NULL, *denom1000 = NULL,

@@ -1331,6 +1331,32 @@ void std_be_build_stratum_request( char *req, struct work *work )
    free( xnonce2str );
 }
 
+// VEIL SHA256Dv
+void veil_sha256dv_build_stratum_request( char *req, struct work *work )
+{
+    uint32_t ntime_enc, nonce_hi_enc, nonce_lo_enc;
+    char ntimestr[9], nonce_hi_str[9], nonce_lo_str[9];
+
+    uint32_t ntime    = work->veil_ntime;
+    uint32_t nonce_hi = work->veil_nonce_hi;
+    uint32_t nonce_lo = work->veil_nonce_lo;
+
+    le32enc(&ntime_enc,    ntime);
+    le32enc(&nonce_hi_enc, nonce_hi);
+    le32enc(&nonce_lo_enc, nonce_lo);
+
+    bin2hex(ntimestr,    (char *)&ntime_enc,    sizeof(uint32_t));
+    bin2hex(nonce_hi_str,(char *)&nonce_hi_enc, sizeof(uint32_t));
+    bin2hex(nonce_lo_str,(char *)&nonce_lo_enc, sizeof(uint32_t));
+
+    snprintf(req, JSON_BUF_LEN, json_submit_req,
+             rpc_user,
+             work->job_id ? work->job_id : "",
+             nonce_hi_str,
+             ntimestr,
+             nonce_lo_str);
+}
+
 static const char *json_getwork_req = 
   "{\"method\": \"getwork\", \"params\": [\"%s\"], \"id\":4}\r\n";
 
@@ -1838,67 +1864,179 @@ static void update_submit_stats( struct work *work, const void *hash )
    pthread_mutex_unlock( &stats_lock );
 }
 
-bool submit_solution( struct work *work, const void *hash,
-                      struct thr_info *thr )
+bool submit_solution(struct work *work, const void *hash, struct thr_info *thr)
 {
-// Job went stale during hashing of a valid share.
-//   if ( !opt_quiet && work_restart[ thr->id ].restart )
-//      applog( LOG_INFO, CL_LBL "Share may be stale, submitting anyway..." CL_N );
-   
-   work->sharediff = hash_to_diff( hash );
-   if ( likely( submit_work( thr, work ) ) )
-   {
-     update_submit_stats( work, hash );
+    if (work->veil_sha256dv) {
+        uint32_t *h = (uint32_t*)hash;
 
-     if unlikely( !have_stratum && !have_longpoll )
-     {   // solo, block solved, force getwork
-         pthread_rwlock_wrlock( &g_work_lock );
-         g_work_time = 0;
-         pthread_rwlock_unlock( &g_work_lock );
-         restart_threads();
-     }
+        /* --- DEBUG: log exactly what is passed into hash_to_diff() --- */
+        if (opt_debug) {
+            /* 8 × uint32 w takiej kolejności, w jakiej idą do hash_to_diff() */
+            applog(LOG_INFO,
+                   "DiffHash[ 7: 0]: %08x %08x %08x %08x %08x %08x %08x %08x",
+                   h[7], h[6], h[5], h[4], h[3], h[2], h[1], h[0]);
 
-     if ( !opt_quiet )
-     {
-        if ( have_stratum )
-        {
-           applog( LOG_INFO, "%d Submitted Diff %.5g, Block %d, Job %s",
-                   submitted_share_count, work->sharediff, work->height,
-                   work->job_id );
-           if ( opt_debug && opt_extranonce )
-           {
-              unsigned char *xnonce2str = abin2hex( work->xnonce2,
-                                                    work->xnonce2_len );
-              applog( LOG_INFO, "Xnonce2 %s", xnonce2str );
-              free( xnonce2str );
-           }
+            /* hash w LE bajtach (tak jak leży w pamięci) */
+            char hex_le[65];
+            for (int i = 0; i < 32; i++)
+                sprintf(hex_le + i*2, "%02x", ((const uint8_t*)hash)[i]);
+            hex_le[64] = 0;
+            applog(LOG_INFO, "DiffHash(LE-bytes): %s", hex_le);
+
+            /* hash w BE bajtach (jak w explorerze / proxy) */
+            char hex_be[65];
+            for (int i = 0; i < 32; i++)
+                sprintf(hex_be + i*2, "%02x", ((const uint8_t*)hash)[31 - i]);
+            hex_be[64] = 0;
+            applog(LOG_INFO, "DiffHash(BE-bytes): %s", hex_be);
         }
-        else
-           applog( LOG_INFO, "%d Submitted Diff %.5g, Block %d, Ntime %08x",
-                   submitted_share_count, work->sharediff, work->height,
-                   work->data[ algo_gate.ntime_index ] );
+        /* --- END DEBUG --- */
 
-        if ( opt_debug )
-        {
-           uint32_t* h = (uint32_t*)hash;
-           uint32_t* t = (uint32_t*)work->target;
-           uint32_t* d = (uint32_t*)work->data;
+        work->sharediff = hash_to_diff(hash);
 
-           applog( LOG_INFO, "Data[ 0: 9]: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
-                                                 d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9] );
-           applog( LOG_INFO, "Data[10:19]: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
-                                        d[10],d[11],d[12],d[13],d[14],d[15],d[16],d[17],d[18],d[19] );
-           applog( LOG_INFO, "Hash[ 7: 0]: %08x %08x %08x %08x %08x %08x %08x %08x",
-                                                            h[7],h[6],h[5],h[4],h[3],h[2],h[1],h[0] );
-           applog( LOG_INFO, "Targ[ 7: 0]: %08x %08x %08x %08x %08x %08x %08x %08x",
-                                                            t[7],t[6],t[5],t[4],t[3],t[2],t[1],t[0] );
+        update_submit_stats(work, hash);
+
+        uint8_t stage2[80];
+        uint8_t *p = stage2;
+
+        uint32_t version_host = work->data[0];
+        le32enc(p, version_host);
+        p += 4;
+
+        memcpy(p, work->veil_midstate_be, 32);
+        p += 32;
+
+        for (int i = 0; i < 32; i++)
+            p[i] = work->veil_merkle_be[31 - i];
+        p += 32;
+
+        le32enc(p, work->veil_ntime);
+        p += 4;
+
+        le32enc(p, work->veil_nonce_lo);
+        p += 4;
+
+        le32enc(p, work->veil_nonce_hi);
+        p += 4;
+
+         if (opt_debug)
+         {
+             uint32_t *h = (uint32_t*)hash;
+             uint32_t *t = (uint32_t*)work->target;
+
+             uint32_t *d = (uint32_t*)stage2;
+
+             applog(LOG_INFO,
+                    "Data[ 0: 9]:  %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
+
+             applog(LOG_INFO,
+                    "Data[10:19]: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                    d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19]);
+
+             applog(LOG_INFO,
+                    "Hash[ 7: 0]: %08x %08x %08x %08x %08x %08x %08x %08x",
+                    h[7], h[6], h[5], h[4], h[3], h[2], h[1], h[0]);
+
+             applog(LOG_INFO,
+                    "Targ[ 7: 0]: %08x %08x %08x %08x %08x %08x %08x %08x",
+                    t[7], t[6], t[5], t[4], t[3], t[2], t[1], t[0]);
+
+             {
+                 char hex[65];
+                 for (int i = 0; i < 32; i++)
+                     sprintf(hex + 2*i, "%02x", ((uint8_t*)hash)[31 - i]);
+                 hex[64] = 0;
+
+                 applog(LOG_INFO, "Hash(BE): %s", hex);
+             }
+         }
+
+
+        char req[JSON_BUF_LEN];
+        veil_sha256dv_build_stratum_request(req, work);
+
+        if (!stratum_send_line(&stratum, req)) {
+            applog(LOG_WARNING, "VEIL submit: failed to send");
+            return false;
         }
-     }
-     return true;
-   }
-   else
-     applog( LOG_WARNING, "%d failed to submit share", submitted_share_count );
-   return false;
+
+        if (!opt_quiet) {
+            applog(LOG_INFO,
+                   "%d VEIL Submitted nonce_hi=%08x nonce_lo=%08x Diff %.5g Job %s",
+                   submitted_share_count,
+                   work->veil_nonce_hi,
+                   work->veil_nonce_lo,
+                   work->sharediff,
+                   work->job_id);
+        }
+
+        if (opt_debug) {
+            uint32_t hash_be_u32[8];
+            for (int i = 0; i < 8; i++)
+                be32enc(hash_be_u32 + i, h[7 - i]);
+
+            applog(LOG_INFO,
+                   "VEIL HASH_BE: %08x %08x %08x %08x %08x %08x %08x %08x",
+                   hash_be_u32[0], hash_be_u32[1], hash_be_u32[2], hash_be_u32[3],
+                   hash_be_u32[4], hash_be_u32[5], hash_be_u32[6], hash_be_u32[7]);
+         }
+
+        return true;
+    }
+
+    work->sharediff = hash_to_diff(hash);
+    if (likely(submit_work(thr, work))) {
+        update_submit_stats(work, hash);
+
+        if unlikely(!have_stratum && !have_longpoll) {
+            pthread_rwlock_wrlock(&g_work_lock);
+            g_work_time = 0;
+            pthread_rwlock_unlock(&g_work_lock);
+            restart_threads();
+        }
+
+        if (!opt_quiet) {
+            if (have_stratum) {
+                applog(LOG_INFO, "%d Submitted Diff %.5g, Block %d, Job %s",
+                       submitted_share_count, work->sharediff,
+                       work->height, work->job_id);
+                if (opt_debug && opt_extranonce) {
+                    unsigned char *xnonce2str =
+                        abin2hex(work->xnonce2, work->xnonce2_len);
+                    applog(LOG_INFO, "Xnonce2 %s", xnonce2str);
+                    free(xnonce2str);
+                }
+            } else {
+                applog(LOG_INFO, "%d Submitted Diff %.5g, Block %d, Ntime %08x",
+                       submitted_share_count, work->sharediff,
+                       work->height, work->data[algo_gate.ntime_index]);
+            }
+
+            if (opt_debug) {
+                uint32_t *h = (uint32_t*)hash;
+                uint32_t *t = (uint32_t*)work->target;
+                uint32_t *d = (uint32_t*)work->data;
+
+                applog(LOG_INFO,
+                       "Data[ 0: 9]: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                       d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9]);
+                applog(LOG_INFO,
+                       "Data[10:19]: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                       d[10],d[11],d[12],d[13],d[14],d[15],d[16],d[17],d[18],d[19]);
+                applog(LOG_INFO,
+                       "Hash[ 7: 0]: %08x %08x %08x %08x %08x %08x %08x %08x",
+                       h[7],h[6],h[5],h[4],h[3],h[2],h[1],h[0]);
+                applog(LOG_INFO,
+                       "Targ[ 7: 0]: %08x %08x %08x %08x %08x %08x %08x %08x",
+                       t[7],t[6],t[5],t[4],t[3],t[2],t[1],t[0]);
+            }
+        }
+        return true;
+    }
+
+    applog(LOG_WARNING, "%d failed to submit share", submitted_share_count);
+    return false;
 }
 
 static bool wanna_mine(int thr_id)
@@ -1998,413 +2136,414 @@ void std_get_new_work( struct work* work, struct work* g_work, int thr_id,
        ++(*nonceptr);
 }
 
-static void stratum_gen_work( struct stratum_ctx *sctx, struct work *g_work )
+static void stratum_gen_work(struct stratum_ctx *sctx, struct work *g_work)
 {
    bool new_job;
+   bool is_veil = sctx->job.veil_sha256dv;   // VEIL SHA256Dv job?
 
-   pthread_mutex_lock( &sctx->work_lock );
+   pthread_mutex_lock(&sctx->work_lock);
 
-   new_job =  sctx->new_job;  // otherwise just increment extranonce2
+   new_job       = sctx->new_job;
    sctx->new_job = false;
 
-   pthread_rwlock_wrlock( &g_work_lock );
-   
-   free( g_work->job_id );
-   g_work->job_id = strdup( sctx->job.job_id );
-   g_work->xnonce2_len = sctx->xnonce2_size;
-   g_work->xnonce2 = (uchar*) realloc( g_work->xnonce2, sctx->xnonce2_size );
+   pthread_rwlock_wrlock(&g_work_lock);
+
+   free(g_work->job_id);
+   g_work->job_id = strdup(sctx->job.job_id);
    g_work->height = sctx->block_height;
-   g_work->targetdiff = sctx->job.diff
-                           / ( opt_target_factor * opt_diff_factor );
-   memcpy( g_work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size );
-   algo_gate.build_extraheader( g_work, sctx );
-   net_diff = nbits_to_diff( g_work->data[ algo_gate.nbits_index ] );
-   algo_gate.set_work_data_endian( g_work );
-   diff_to_hash( g_work->target, g_work->targetdiff );
+   g_work->targetdiff = sctx->job.diff / (opt_target_factor * opt_diff_factor);
+
+   g_work->veil_sha256dv = is_veil;
+
+   if (is_veil) {
+
+      if (new_job) {
+         memcpy(g_work->veil_midstate_be, sctx->job.veil_midstate_be, 32);
+         memcpy(g_work->veil_merkle_be,   sctx->job.veil_merkle_be,   32);
+
+         g_work->veil_ntime    = sctx->job.veil_ntime;
+         g_work->veil_nonce_hi = sctx->job.veil_nonce_hi;
+      } else {
+         g_work->veil_nonce_hi += (uint32_t)opt_n_threads;
+      }
+
+      g_work->xnonce2_len = 0;
+
+      uint32_t ver =
+           (uint32_t)sctx->job.version[0]
+         | ((uint32_t)sctx->job.version[1] << 8)
+         | ((uint32_t)sctx->job.version[2] << 16)
+         | ((uint32_t)sctx->job.version[3] << 24);
+      g_work->data[0] = ver;
+
+      uint32_t nbits_le = le32dec(sctx->job.nbits);
+
+      g_work->data[algo_gate.nbits_index] = nbits_le;
+      net_diff = nbits_to_diff(nbits_le);
+
+      if (opt_debug) {
+         applog(LOG_INFO,
+                "stratum_gen_work[VEIL]: new_job=%d job=%s ver=%08x "
+                "ntime=%u nonce_hi=%08x nbits=%08x",
+                new_job,
+                sctx->job.job_id ? sctx->job.job_id : "(null)",
+                ver,
+                g_work->veil_ntime,
+                g_work->veil_nonce_hi,
+                nbits_le);
+      }
+   } else {
+
+      g_work->xnonce2_len = sctx->xnonce2_size;
+      g_work->xnonce2 = (uchar *)realloc(g_work->xnonce2, sctx->xnonce2_size);
+      memcpy(g_work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
+
+      algo_gate.build_extraheader(g_work, sctx);
+      net_diff = nbits_to_diff(g_work->data[algo_gate.nbits_index]);
+      algo_gate.set_work_data_endian(g_work);
+   }
+
+   diff_to_hash(g_work->target, g_work->targetdiff);
 
    g_work_time = time(NULL);
    restart_threads();
-   pthread_rwlock_unlock( &g_work_lock );
+   pthread_rwlock_unlock(&g_work_lock);
 
-   // Pre increment extranonce2 in case of being called again before receiving
-   // a new job
-   for ( int t = 0;
-         t < sctx->xnonce2_size && !( ++sctx->job.xnonce2[t] );
-         t++ );
+   if (!is_veil) {
+      for (int t = 0;
+           t < sctx->xnonce2_size && !(++sctx->job.xnonce2[t]);
+           t++);
+   }
 
-   pthread_mutex_unlock( &sctx->work_lock );
+   pthread_mutex_unlock(&sctx->work_lock);
 
-   pthread_mutex_lock( &stats_lock );
+   pthread_mutex_lock(&stats_lock);
 
    double hr = 0.;
-   for ( int i = 0; i < opt_n_threads; i++ )
+   for (int i = 0; i < opt_n_threads; i++)
       hr += thr_hashrates[i];
    global_hashrate = hr;
 
-   pthread_mutex_unlock( &stats_lock );
+   pthread_mutex_unlock(&stats_lock);
 
-   if ( stratum_diff != sctx->job.diff )
-      applog( LOG_BLUE, "New Stratum Diff %g, Block %d, Tx %d, Job %s",
+   if (stratum_diff != sctx->job.diff)
+      applog(LOG_BLUE, "New Stratum Diff %g, Block %d, Tx %d, Job %s",
                         sctx->job.diff, sctx->block_height,
-                        sctx->job.merkle_count, g_work->job_id );
-   else if ( last_block_height != sctx->block_height )
-      applog( LOG_BLUE, "New Block %d, Tx %d, Netdiff %.5g, Job %s",
+                        sctx->job.merkle_count, g_work->job_id);
+   else if (last_block_height != sctx->block_height)
+      applog(LOG_BLUE, "New Block %d, Tx %d, Netdiff %.5g, Job %s",
                         sctx->block_height, sctx->job.merkle_count,
-                        net_diff, g_work->job_id );
-   else if ( g_work->job_id && new_job )
-      applog( LOG_BLUE, "New Work: Block %d, Tx %d, Netdiff %.5g, Job %s",
-                         sctx->block_height, sctx->job.merkle_count,
-                         net_diff, g_work->job_id );
-   else if ( opt_debug )
-   {
-      unsigned char *xnonce2str = bebin2hex( g_work->xnonce2,
-                                             g_work->xnonce2_len );
-      applog( LOG_INFO, "Extranonce2 0x%s, Block %d, Job %s",
-                        xnonce2str, sctx->block_height, g_work->job_id );
-      free( xnonce2str );
+                        net_diff, g_work->job_id);
+   else if (g_work->job_id && new_job)
+      applog(LOG_BLUE, "New Work: Block %d, Tx %d, Netdiff %.5g, Job %s",
+                        sctx->block_height, sctx->job.merkle_count,
+                        net_diff, g_work->job_id);
+   else if (opt_debug) {
+      if (!is_veil) {
+         unsigned char *xnonce2str = bebin2hex(g_work->xnonce2,
+                                               g_work->xnonce2_len);
+         applog(LOG_INFO, "Extranonce2 0x%s, Block %d, Job %s",
+                          xnonce2str, sctx->block_height, g_work->job_id);
+         free(xnonce2str);
+      } else {
+         applog(LOG_INFO,
+                "VEIL SHA256Dv work: Block %d, Job %s, nonce_hi=%08x",
+                sctx->block_height,
+                g_work->job_id ? g_work->job_id : "(null)",
+                g_work->veil_nonce_hi);
+      }
    }
 
-   // Update data and calculate new estimates.
-   if ( ( stratum_diff != sctx->job.diff )
-     || ( last_block_height != sctx->block_height ) )
+   /* Update data and calculate new estimates. */
+   if ( (stratum_diff != sctx->job.diff)
+     || (last_block_height != sctx->block_height) )
    {
-      if ( unlikely( !session_first_block ) )
+      if (unlikely(!session_first_block))
          session_first_block = stratum.block_height;
       last_block_height = stratum.block_height;
       stratum_diff      = sctx->job.diff;
       last_targetdiff   = g_work->targetdiff;
-      if ( lowest_share < last_targetdiff )
+      if (lowest_share < last_targetdiff)
          lowest_share = 9e99;
+   }
+
+   if (new_job && !opt_quiet)
+   {
+      applog2(LOG_INFO, "Diff: Net %.5g, Stratum %.5g, Target %.5g",
+                         net_diff, stratum_diff, g_work->targetdiff);
+
+      if (likely(hr > 0.))
+      {
+         double nd = net_diff * exp32;
+         char hr_units[4] = {0};
+         char block_ttf[32];
+         char share_ttf[32];
+         static bool multipool = false;
+
+         if (stratum.block_height < last_block_height) multipool = true;
+
+         sprintf_et(block_ttf, nd / hr);
+         sprintf_et(share_ttf, (g_work->targetdiff * exp32) / hr);
+         scale_hash_for_display(&hr, hr_units);
+         applog2(LOG_INFO, "TTF @ %.2f %sh/s: Block %s, Share %s",
+                            hr, hr_units, block_ttf, share_ttf);
+
+         if (!multipool && last_block_height > session_first_block)
+         {
+            struct timeval now, et;
+            gettimeofday(&now, NULL);
+            timeval_subtract(&et, &now, &session_start);
+            uint64_t net_ttf = safe_div(et.tv_sec,
+                                        last_block_height - session_first_block, 0);
+            if (net_diff > 0. && net_ttf)
+            {
+               double net_hr = safe_div(nd, net_ttf, 0.);
+               char net_hr_units[4] = {0};
+               scale_hash_for_display(&net_hr, net_hr_units);
+               applog2(LOG_INFO, "Net hash rate (est) %.2f %sh/s",
+                                  net_hr, net_hr_units);
+            }
+         }
+      }  // hr > 0
+   } // !quiet
+}
+
+
+static void *miner_thread(void *userdata)
+{
+    struct work work __attribute__((aligned(64)));
+    struct thr_info *mythr = (struct thr_info *) userdata;
+    int thr_id = mythr->id;
+
+    bool is_veil = (opt_algo == 45);
+
+    uint32_t max_nonce;
+    uint32_t *nonceptr = work.data + algo_gate.nonce_index;
+
+    uint32_t end_nonce =
+        0xffffffffU / opt_n_threads * (thr_id + 1) - opt_n_threads;
+
+    memset(&work, 0, sizeof(work));
+
+    /* --- priorytety CPU (oryginał) --- */
+    if (!opt_priority) {
+        setpriority(PRIO_PROCESS, 0, 19);
+        if (!thr_id && opt_debug)
+            applog(LOG_INFO, "Default miner thread priority %d (nice 19)", opt_priority);
+        drop_policy();
+    } else {
+        int prio = 0;
+#ifndef WIN32
+        prio = 18;
+        switch (opt_priority) {
+            case 1: prio = 5; break;
+            case 2: prio = 0; break;
+            case 3: prio = -5; break;
+            case 4: prio = -10; break;
+            case 5: prio = -15;
+        }
+        if (!thr_id) {
+            applog(LOG_INFO, "User set miner thread priority %d (nice %d)", opt_priority, prio);
+            applog(LOG_WARNING, "High priority mining threads may cause system instability");
+        }
+#endif
+        setpriority(PRIO_PROCESS, 0, prio);
+        if (opt_priority == 0)
+            drop_policy();
     }
 
-    if ( new_job && !opt_quiet )
-    {
-       applog2( LOG_INFO, "Diff: Net %.5g, Stratum %.5g, Target %.5g",
-                          net_diff, stratum_diff, g_work->targetdiff );
+    if (opt_affinity && num_cpus > 1)
+        affine_to_cpu(mythr);
 
-       if ( likely( hr > 0. ) )
-       {
-          double nd = net_diff * exp32;
-          char hr_units[4] = {0};
-          char block_ttf[32];
-          char share_ttf[32];
-          static bool multipool = false;
-      
-          if ( stratum.block_height < last_block_height ) multipool = true;
-            
-          sprintf_et( block_ttf, nd / hr );
-          sprintf_et( share_ttf, ( g_work->targetdiff * exp32 ) / hr );
-          scale_hash_for_display ( &hr, hr_units );
-          applog2( LOG_INFO, "TTF @ %.2f %sh/s: Block %s, Share %s",
-                             hr, hr_units, block_ttf, share_ttf );
+    if (!algo_gate.miner_thread_init(thr_id)) {
+        applog(LOG_ERR, "FAIL: thread %d failed to initialize", thr_id);
+        exit(1);
+    }
 
-          if ( !multipool && last_block_height > session_first_block )
-          {
-             struct timeval now, et;
-             gettimeofday( &now, NULL );
-             timeval_subtract( &et, &now, &session_start );
-             uint64_t net_ttf = safe_div( et.tv_sec,
-                                 last_block_height - session_first_block, 0 );
-             if ( net_diff > 0. && net_ttf )
-             {
-                double net_hr = safe_div( nd, net_ttf, 0. );
-                char net_hr_units[4] = {0};
-                scale_hash_for_display ( &net_hr, net_hr_units );
-                applog2( LOG_INFO, "Net hash rate (est) %.2f %sh/s",
-                                   net_hr, net_hr_units );
-             }
-          }
-       }  // hr > 0
-    } // !quiet
-}
+    /* wait for first stratum job */
+    if (have_stratum)
+        while (unlikely(!stratum.job.job_id)) {
+            if (opt_debug)
+                applog(LOG_INFO, "Thread %d waiting for first job", thr_id);
+            sleep(1);
+        }
 
-static void *miner_thread( void *userdata )
-{
-   struct   work work __attribute__ ((aligned (64))) ;
-   struct   thr_info *mythr = (struct thr_info *) userdata;
-   int      thr_id = mythr->id;
-   uint32_t max_nonce;
-   uint32_t *nonceptr = work.data + algo_gate.nonce_index;
+    int64_t max64 = 20;
+    thr_hashrates[thr_id] = 20;
 
-   // end_nonce gets read before being set so it needs to be initialized
-   // what is an appropriate value that is completely neutral?
-   // zero seems to work. No, it breaks benchmark.
-//   uint32_t end_nonce = 0;
-//   uint32_t end_nonce = opt_benchmark
-//                      ? ( 0xffffffffU / opt_n_threads ) * (thr_id + 1) - 0x20
-//                      : 0;
-   uint32_t end_nonce = 0xffffffffU / opt_n_threads  * (thr_id + 1) - opt_n_threads;
+    /* ==========================
+     *    GŁÓWNA PĘTLA
+     * ========================== */
+    while (1) {
+        uint64_t hashes_done;
+        struct timeval tv_start, tv_end, diff;
+        int nonce_found = 0;
 
-   memset( &work, 0, sizeof(work) );
- 
-   /* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
-    * and if that fails, then SCHED_BATCH. No need for this to be an
-    * error if it fails */
-   if ( !opt_priority )
-   {
-      setpriority(PRIO_PROCESS, 0, 19);
-      if ( !thr_id && opt_debug )
-         applog(LOG_INFO, "Default miner thread priority %d (nice 19)", opt_priority );
-      drop_policy();
-   }
-   else
-   {
-      int prio = 0;
-#ifndef WIN32
-      prio = 18;
-      // note: different behavior on linux (-19 to 19)
-	   switch ( opt_priority )
-      {
-	      case 1:   prio =   5;   break;
-	      case 2:   prio =   0;   break;
-	      case 3:   prio =  -5;   break;
-	      case 4:   prio = -10;   break;
-	      case 5:   prio = -15;
-      }
-	   if ( !thr_id )
-      {
-         applog( LOG_INFO, "User set miner thread priority %d (nice %d)",
-                          opt_priority, prio );
-         applog( LOG_WARNING, "High priority mining threads may cause system instability");
-      }
-#endif
-      setpriority(PRIO_PROCESS, 0, prio);
-	   if ( opt_priority == 0 )
-	      drop_policy();
-   }
-
-   // CPU thread affinity
-   if ( opt_affinity && num_cpus > 1 )   affine_to_cpu( mythr );
-
-   if ( !algo_gate.miner_thread_init( thr_id ) )
-   {
-      applog( LOG_ERR, "FAIL: thread %d failed to initialize", thr_id );
-      exit (1);
-   }
-
-   // wait for stratum to send first job
-   if ( have_stratum ) while ( unlikely( !stratum.job.job_id ) )
-   {
-     if ( opt_debug )
-        applog( LOG_INFO, "Thread %d waiting for first job", thr_id );
-     sleep(1);
-   }
-
-   // nominal startng values
-   int64_t max64 = 20;
-   thr_hashrates[thr_id] = 20;
-   while (1)
-   {
-       uint64_t hashes_done;
-       struct timeval tv_start, tv_end, diff;
-       int nonce_found = 0;
-
-       if ( have_stratum ) 
-       {
-          while ( unlikely( stratum_down ) )
-             sleep( 1 );
-          if ( unlikely( ( *nonceptr >= end_nonce )
-                        && !work_restart[thr_id].restart ) )
-          {
-             if ( opt_extranonce )
-                stratum_gen_work( &stratum, &g_work );
-             else
-             {
-                if ( !thr_id )
-                {
-                   applog( LOG_WARNING, "Nonce range exhausted, extranonce not subscribed." );
-                   applog( LOG_WARNING, "Waiting for new work...");
-                }
-                while ( !work_restart[thr_id].restart )
-                   sleep ( 1 );
-             }
-          }
-       }
-       else if ( !opt_benchmark ) // GBT or getwork
-       {
-          pthread_rwlock_wrlock( &g_work_lock );
-          const time_t now = time(NULL);
-          if ( ( ( now - g_work_time ) >= opt_scantime )
-             || ( *nonceptr >= end_nonce ) )
-          {
-             if ( unlikely( !get_work( mythr, &g_work ) ) )
-             {
-                pthread_rwlock_unlock( &g_work_lock );
-                applog( LOG_ERR, "work retrieval failed, exiting miner thread %d", thr_id );
-		          goto out;
-	          }
-             g_work_time = now;
-          }
-          pthread_rwlock_unlock( &g_work_lock );
-       }
-
-       pthread_rwlock_rdlock( &g_work_lock );
-
-       algo_gate.get_new_work( &work, &g_work, thr_id, &end_nonce );
-       work_restart[thr_id].restart = 0;
-
-       pthread_rwlock_unlock( &g_work_lock );
-
-       // conditional mining
-       if ( unlikely( !wanna_mine( thr_id ) ) )
-       {
-          restart_threads();
-          sleep(5);
-          continue;
-       }
-       
-       // opt_scantime expressed in hashes
-       max64 = opt_scantime * thr_hashrates[thr_id];
-
-       // time limit
-       if ( unlikely( opt_time_limit ) )
-       {
-          unsigned int now = (unsigned int)time(NULL);
-          if ( now >= time_limit_stop )
-          {
-             if ( thr_id != 0 )
-             {
+        /* --- JOB UPDATE / RESTART --- */
+        if (have_stratum) {
+            while (unlikely(stratum_down))
                 sleep(1);
-                continue;
-             }
-             if (opt_benchmark)
-             {
-                char rate[32];
-                format_hashrate( global_hashrate, rate );
-                applog( LOG_NOTICE, "Benchmark: %s", rate );
-             }
-             else
-                applog( LOG_NOTICE, "Mining timeout of %ds reached, exiting...",
-                        opt_time_limit);
 
-             proper_exit(0);
-          }
-          // else
-          if ( time_limit_stop - now < opt_scantime )
-              max64 = ( time_limit_stop - now ) * thr_hashrates[thr_id] ;
-       }
+            if (unlikely((*nonceptr >= end_nonce) &&
+                         !work_restart[thr_id].restart)) {
+                if (opt_extranonce)
+                    stratum_gen_work(&stratum, &g_work);
+                else {
+                    if (!thr_id) {
+                        applog(LOG_WARNING, "Nonce range exhausted, extranonce not subscribed.");
+                        applog(LOG_WARNING, "Waiting for new work...");
+                    }
+                    while (!work_restart[thr_id].restart)
+                        sleep(1);
+                }
+            }
 
-       // Select nonce range based on max64, the estimated number of hashes
-       // to meet the desired scan time.
-       // Initial value arbitrarilly set to 1000 just to get
-       // a sample hashrate for the next time.
-       uint32_t work_nonce = *nonceptr;
-       if ( max64 <= 0)
-          max64 = 1000;
-       if ( work_nonce + max64 > end_nonce )
-          max_nonce = end_nonce;
-       else
-          max_nonce = work_nonce + (uint32_t)max64;
+        } else if (!opt_benchmark) {
+            pthread_rwlock_wrlock(&g_work_lock);
+            const time_t now = time(NULL);
+            if (((now - g_work_time) >= opt_scantime) ||
+                (*nonceptr >= end_nonce)) {
 
-       // init time
-       hashes_done = 0;
-       gettimeofday( (struct timeval *) &tv_start, NULL );
+                if (unlikely(!get_work(mythr, &g_work))) {
+                    pthread_rwlock_unlock(&g_work_lock);
+                    applog(LOG_ERR, "work retrieval failed, exiting miner thread %d", thr_id);
+                    goto out;
+                }
+                g_work_time = now;
+            }
+            pthread_rwlock_unlock(&g_work_lock);
+        }
 
-       // Scan for nonce
-       nonce_found = algo_gate.scanhash( &work, max_nonce, &hashes_done,
-                                         mythr );
+        /* --- LOAD WORK --- */
+        pthread_rwlock_rdlock(&g_work_lock);
+        algo_gate.get_new_work(&work, &g_work, thr_id, &end_nonce);
+        work_restart[thr_id].restart = 0;
+        pthread_rwlock_unlock(&g_work_lock);
 
-       // record scanhash elapsed time
-       gettimeofday( &tv_end, NULL );
-       timeval_subtract( &diff, &tv_end, &tv_start );
-       if ( diff.tv_usec || diff.tv_sec )
-       {
-          pthread_mutex_lock( &stats_lock );
-          total_hashes += hashes_done;
-          total_hashes_time = tv_end;
-          thr_hashrates[thr_id] =
-          hashes_done / ( diff.tv_sec + diff.tv_usec * 1e-6 );
-          pthread_mutex_unlock( &stats_lock );
-       }
+        if (unlikely(!wanna_mine(thr_id))) {
+            restart_threads();
+            sleep(5);
+            continue;
+        }
 
-       // This code is deprecated, scanhash should never return true.
-       // This remains as a backup in case some old implementations still exist.
-       // If unsubmiited nonce(s) found, submit now. 
-       if ( unlikely( nonce_found && !opt_benchmark ) )
-       {  
-          applog( LOG_WARNING, "BUG: See RELEASE_NOTES for reporting bugs. Algo = %s.",
-                               algo_names[ opt_algo ] );
-          if ( !submit_work( mythr, &work ) )
-          {
-             applog( LOG_WARNING, "Failed to submit share." );
-             break;
-          }
-          if ( !opt_quiet )
-              applog( LOG_NOTICE, "%d: submitted by thread %d.",
-                      accepted_share_count + rejected_share_count + 1,
-                      mythr->id );
+        max64 = opt_scantime * thr_hashrates[thr_id];
 
-          // prevent stale work in solo
-          // we can't submit twice a block!
-          if unlikely( !have_stratum && !have_longpoll )
-          {
-             pthread_rwlock_wrlock( &g_work_lock );
-             // will force getwork
-             g_work_time = 0;
-             pthread_rwlock_unlock( &g_work_lock );
-          }
-       }
+        /* ======================
+         * VEIL SHA256Dv TRYB
+         * ====================== */
+        if (is_veil) {
+            /* Zignoruj max_nonce / nonceptr — scanhash SHA256Dv zarządza nonce_low/hi */
+            max_nonce = 0xffffffffU;
 
-       // display hashrate
-       if ( unlikely( opt_hash_meter ) )
-       {
-          char hr[16];
-          char hr_units[2] = {0,0};
-          double hashrate;
+            hashes_done = 0;
+            gettimeofday(&tv_start, NULL);
 
-          hashrate  = thr_hashrates[thr_id];
-          if ( hashrate != 0. )
-          {
-             scale_hash_for_display( &hashrate,  hr_units );
-             sprintf( hr, "%.2f", hashrate );
-             applog( LOG_INFO, "Thread %d, CPU %d: %s %sh/s",
-                        thr_id, thread_affinity_map[ thr_id ], hr, hr_units );
-          }
-       }
+            nonce_found = algo_gate.scanhash(&work, max_nonce, &hashes_done, mythr);
 
-       // Display benchmark total
-       // Update hashrate for API if no shares accepted yet.
-       if ( unlikely( ( opt_benchmark || !accepted_share_count ) 
-            && thr_id == opt_n_threads - 1 ) )
-       {
-          double hashrate  = 0.;
-          pthread_mutex_lock( &stats_lock );
-          for ( int i = 0; i < opt_n_threads; i++ )
-              hashrate  += thr_hashrates[i];
-          global_hashrate  = hashrate;
-          pthread_mutex_unlock( &stats_lock );
+            gettimeofday(&tv_end, NULL);
+            timeval_subtract(&diff, &tv_end, &tv_start);
 
-          if ( opt_benchmark )
-          {
-             struct timeval uptime;
-             char hr[16];
-             char hr_units[2] = {0,0};
-             timeval_subtract( &uptime, &total_hashes_time, &session_start ); 
-             double hashrate = safe_div( total_hashes, uptime.tv_sec, 0. );
+            if (diff.tv_usec || diff.tv_sec) {
+                pthread_mutex_lock(&stats_lock);
+                total_hashes += hashes_done;
+                total_hashes_time = tv_end;
+                thr_hashrates[thr_id] =
+                    hashes_done / (diff.tv_sec + diff.tv_usec * 1e-6);
+                pthread_mutex_unlock(&stats_lock);
+            }
 
-             if ( hashrate > 0. )
-             {
-                scale_hash_for_display( &hashrate,  hr_units );
-                sprintf( hr, "%.2f", hashrate );
-#if (defined(_WIN64) || defined(__WINDOWS__) || defined(_WIN32) || defined(__APPLE__))
-                applog( LOG_NOTICE, "Total: %s %sH/s", hr, hr_units );
-#else
-                float lo_freq = 0., hi_freq = 0.;
-                linux_cpu_hilo_freq( &lo_freq, &hi_freq );
-                applog( LOG_NOTICE,
-                     "Total: %s %sH/s, Temp: %dC, Freq: %.3f/%.3f GHz",
-                     hr, hr_units, (uint32_t)cpu_temp(0), lo_freq / 1e6,
-                     hi_freq / 1e6 );
-#endif
-             }
-          }
-       }  // benchmark
-   }  // miner_thread loop
+            continue; /* SKIP reszta BTC-logiki */
+        }
+
+        /* ======================
+         * NORMALNE ALGORYTMY
+         * ====================== */
+
+        uint32_t work_nonce = *nonceptr;
+        if (max64 <= 0)
+            max64 = 1000;
+
+        if (work_nonce + max64 > end_nonce)
+            max_nonce = end_nonce;
+        else
+            max_nonce = work_nonce + (uint32_t)max64;
+
+        hashes_done = 0;
+        gettimeofday(&tv_start, NULL);
+
+        nonce_found =
+            algo_gate.scanhash(&work, max_nonce, &hashes_done, mythr);
+
+        gettimeofday(&tv_end, NULL);
+        timeval_subtract(&diff, &tv_end, &tv_start);
+
+        if (diff.tv_usec || diff.tv_sec) {
+            pthread_mutex_lock(&stats_lock);
+            total_hashes += hashes_done;
+            total_hashes_time = tv_end;
+            thr_hashrates[thr_id] =
+                hashes_done / (diff.tv_sec + diff.tv_usec * 1e-6);
+            pthread_mutex_unlock(&stats_lock);
+        }
+
+        /* deprecated path (oryginał) */
+        if (unlikely(nonce_found && !opt_benchmark)) {
+            applog(LOG_WARNING,
+                   "BUG: See RELEASE_NOTES for reporting bugs. Algo = %s.",
+                   algo_names[opt_algo]);
+
+            if (!submit_work(mythr, &work)) {
+                applog(LOG_WARNING, "Failed to submit share.");
+                break;
+            }
+
+            if (!opt_quiet)
+                applog(LOG_NOTICE, "%d: submitted by thread %d.",
+                       accepted_share_count + rejected_share_count + 1,
+                       mythr->id);
+
+            if unlikely(!have_stratum && !have_longpoll) {
+                pthread_rwlock_wrlock(&g_work_lock);
+                g_work_time = 0;
+                pthread_rwlock_unlock(&g_work_lock);
+            }
+        }
+
+        /* hashrate meter — oryginał */
+        if (unlikely(opt_hash_meter)) {
+            char hr[16], hr_units[2] = {0, 0};
+            double hashrate = thr_hashrates[thr_id];
+
+            if (hashrate != 0.) {
+                scale_hash_for_display(&hashrate, hr_units);
+                sprintf(hr, "%.2f", hashrate);
+                applog(LOG_INFO,
+                       "Thread %d, CPU %d: %s %sh/s",
+                       thr_id, thread_affinity_map[thr_id], hr, hr_units);
+            }
+        }
+
+        /* benchmark totals — oryginał */
+        if (unlikely((opt_benchmark || !accepted_share_count) &&
+                     thr_id == opt_n_threads - 1)) {
+
+            double hashrate = 0.0;
+            pthread_mutex_lock(&stats_lock);
+
+            for (int i = 0; i < opt_n_threads; i++)
+                hashrate += thr_hashrates[i];
+
+            global_hashrate = hashrate;
+            pthread_mutex_unlock(&stats_lock);
+        }
+
+    } /* while */
 
 out:
-	tq_freeze(mythr->q);
-	return NULL;
+    tq_freeze(mythr->q);
+    return NULL;
 }
+
 
 void restart_threads(void)
 {
