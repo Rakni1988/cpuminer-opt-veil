@@ -1,0 +1,58 @@
+name: build-cpuminer
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.name }})
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: generic
+            cflags: "-O3 -march=x86-64 -mtune=generic -Wall"
+          - name: sse42-aes
+            cflags: "-O3 -maes -msse4.2 -Wall"
+          - name: znver2
+            cflags: "-O3 -march=znver2 -Wall"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git autoconf automake libtool pkg-config \
+            build-essential \
+            libcurl4-openssl-dev \
+            libjansson-dev \
+            libssl-dev
+
+      - name: Autogen
+        run: ./autogen.sh
+
+      - name: Configure
+        run: |
+          CFLAGS="${{ matrix.cflags }}" ./configure --with-curl
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp -v cpuminer dist/
+          cp -v README* LICENSE* dist/ 2>/dev/null || true
+          (cd dist && tar -czf ../cpuminer-opt-veil-linux-x86_64-${{ matrix.name }}.tar.gz .)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpuminer-opt-veil-linux-x86_64-${{ matrix.name }}
+          path: cpuminer-opt-veil-linux-x86_64-${{ matrix.name }}.tar.gz
