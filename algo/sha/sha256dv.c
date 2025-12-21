@@ -77,52 +77,73 @@ static inline bool veil_hash_meets_target(const uint32_t *hash,
 
 
 /*
- * Main SHA256Dv loop – equivalent of the Python miner thread,
- * implemented in cpuminer-opt style.
+ * Main SHA256Dv loop (scalar): pre-hash the first 64 bytes of the 80-byte
+ * stage2 buffer (one full SHA256 block), then iterate only over the last
+ * 16 bytes (merkle tail + ntime + nonces). This reduces per-nonce work
+ * without requiring AVX/SIMD paths.
  */
 int scanhash_sha256dv(struct work *work, uint32_t max_nonce,
                       uint64_t *hashes_done, struct thr_info *mythr)
 {
     const int thr_id = mythr->id;
 
-    /* If this work item is not Veil SHA256Dv, fall back immediately. */
     if (!work->veil_sha256dv)
         return 0;
 
     uint8_t  stage2[80] __attribute__((aligned(64)));
-    uint8_t  hash_be[32];
+    uint8_t  tail[16];      /* merkle_tail(4) + ntime(4) + nonce_lo(4) + nonce_hi(4) */
+    uint8_t  hash1[32];
+    uint8_t  hash2[32];
     uint32_t hash_le[8];
 
-    /*
-     * Initial nonce_hi – same scheme as in the Python miner:
-     *   base_hi = job.nonce_hi
-     *   per-thread offset = thread_id
-     */
+    /* Precomputed context after hashing the first 64 bytes (one SHA256 block). */
+    sha256_context base_ctx;
+
     uint32_t nonce_hi = work->veil_nonce_hi + (uint32_t)thr_id;
     uint32_t nonce_lo = 0;
-
     const uint32_t *ptarget = work->target;
+
     *hashes_done = 0;
+
+    /*
+     * Build stage2 once to seed the base context. The first 64 bytes are constant
+     * for a given job, so we hash them once and reuse the intermediate state.
+     */
+    veil_sha256dv_build_stage2(stage2, work, 0, nonce_hi);
+
+    sha256_ctx_init(&base_ctx);
+    sha256_update(&base_ctx, stage2, 64);
+
+    /* Fixed part of the tail for this job: merkle tail (4) + ntime (4). */
+    memcpy(tail, stage2 + 64, 8);
 
     while (!work_restart[thr_id].restart) {
 
-        veil_sha256dv_build_stage2(stage2, work, nonce_lo, nonce_hi);
+        /* Update per-iteration nonces (little-endian). */
+        le32enc(tail + 8,  nonce_lo);
+        le32enc(tail + 12, nonce_hi);
 
-        sha256_full(hash_be, stage2, 80);
-        sha256_full(hash_be, hash_be, 32);
+        /* First SHA256 over 80 bytes using the pre-hashed first block. */
+        sha256_context ctx = base_ctx;
+        sha256_update(&ctx, tail, 16);
+        sha256_final(&ctx, hash1);
 
+        /* Second SHA256 (SHA256D). */
+        sha256_full(hash2, hash1, 32);
+
+        /* Convert digest words to LE for target comparison. */
         for (int i = 0; i < 8; i++)
-            hash_le[i] = be32dec(hash_be + i * 4);
+            hash_le[i] = be32dec(hash2 + i * 4);
 
         if (veil_hash_meets_target(hash_le, ptarget)) {
+
             uint64_t nonce64 = ((uint64_t)nonce_hi << 32) | nonce_lo;
 
-            /* Store final nonce pair for submit */
+            /* Store final nonce pair for submit. */
             work->veil_nonce_lo = nonce_lo;
             work->veil_nonce_hi = nonce_hi;
 
-            if (!submit_solution(work, hash_be, mythr)) {
-                /* Keep only a warning on submit failure – everything else stays silent */
+            if (!submit_solution(work, hash2, mythr)) {
                 applog(LOG_WARNING,
                        "SHA256Dv[%d]: submit_solution failed for job=%s (nonce64=%016" PRIx64 ")",
                        thr_id,
@@ -133,18 +154,17 @@ int scanhash_sha256dv(struct work *work, uint32_t max_nonce,
             (*hashes_done)++;
 
             /*
-             * Advance the high 32 bits by opt_n_threads so the next range
-             * for this thread does not overlap with the current one.
-             * This mirrors the Python miner behaviour and keeps the loop bounded.
+             * Move to the next non-overlapping high-nonce range for this thread.
+             * Mirrors the Python miner / range-splitting scheme.
              */
-            uint32_t new_hi = work->veil_nonce_hi + (uint32_t)opt_n_threads;
-            work->veil_nonce_hi = new_hi;
+            work->veil_nonce_hi = work->veil_nonce_hi + (uint32_t)opt_n_threads;
 
             return 0;
         }
 
         nonce_lo++;
 
+        /* Carry to high part; step by opt_n_threads to keep thread ranges disjoint. */
         if (nonce_lo == 0)
             nonce_hi += (uint32_t)opt_n_threads;
 
